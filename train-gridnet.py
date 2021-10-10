@@ -12,10 +12,302 @@ from tqdm import tqdm
 
 from model import GridNet
 
-from ptsemseg.loader import get_loader, get_data_path
-from ptsemseg.metrics import runningScore
-from ptsemseg.loss import *
-from ptsemseg.augmentations import *
+
+def get_loader(name):
+    """get_loader
+    :param name:
+    """
+    return {
+        'pascal': pascalVOCLoader,
+        'camvid': camvidLoader,
+        'ade20k': ADE20KLoader,
+        'mit_sceneparsing_benchmark': MITSceneParsingBenchmarkLoader,
+        'cityscapes': cityscapesLoader,
+        'nyuv2': NYUv2Loader,
+        'sunrgbd': SUNRGBDLoader,
+    }[name]
+
+
+def get_data_path(name, config_file='config.json'):
+    """get_data_path
+    :param name:
+    :param config_file:
+    """
+    data = json.load(open(config_file))
+    return data[name]['data_path']
+
+
+import math
+import numbers
+import random
+from PIL import Image, ImageOps
+
+class Compose(object):
+    def __init__(self, augmentations):
+        self.augmentations = augmentations
+
+    def __call__(self, img, mask):
+        img, mask = Image.fromarray(img, mode='RGB'), Image.fromarray(mask, mode='L')            
+        assert img.size == mask.size
+        for a in self.augmentations:
+            img, mask = a(img, mask)
+        return np.array(img), np.array(mask, dtype=np.uint8)
+
+
+class RandomCrop(object):
+    def __init__(self, size, padding=0):
+        if isinstance(size, numbers.Number):
+            self.size = (int(size), int(size))
+        else:
+            self.size = size
+        self.padding = padding
+
+    def __call__(self, img, mask):
+        if self.padding > 0:
+            img = ImageOps.expand(img, border=self.padding, fill=0)
+            mask = ImageOps.expand(mask, border=self.padding, fill=0)
+
+        assert img.size == mask.size
+        w, h = img.size
+        th, tw = self.size
+        if w == tw and h == th:
+            return img, mask
+        if w < tw or h < th:
+            return img.resize((tw, th), Image.BILINEAR), mask.resize((tw, th), Image.NEAREST)
+
+        x1 = random.randint(0, w - tw)
+        y1 = random.randint(0, h - th)
+        return img.crop((x1, y1, x1 + tw, y1 + th)), mask.crop((x1, y1, x1 + tw, y1 + th))
+
+
+class CenterCrop(object):
+    def __init__(self, size):
+        if isinstance(size, numbers.Number):
+            self.size = (int(size), int(size))
+        else:
+            self.size = size
+
+    def __call__(self, img, mask):
+        assert img.size == mask.size
+        w, h = img.size
+        th, tw = self.size
+        x1 = int(round((w - tw) / 2.))
+        y1 = int(round((h - th) / 2.))
+        return img.crop((x1, y1, x1 + tw, y1 + th)), mask.crop((x1, y1, x1 + tw, y1 + th))
+
+
+class RandomHorizontallyFlip(object):
+    def __call__(self, img, mask):
+        if random.random() < 0.5:
+            return img.transpose(Image.FLIP_LEFT_RIGHT), mask.transpose(Image.FLIP_LEFT_RIGHT)
+        return img, mask
+
+
+class FreeScale(object):
+    def __init__(self, size):
+        self.size = tuple(reversed(size))  # size: (h, w)
+
+    def __call__(self, img, mask):
+        assert img.size == mask.size
+        return img.resize(self.size, Image.BILINEAR), mask.resize(self.size, Image.NEAREST)
+
+
+class Scale(object):
+    def __init__(self, size):
+        self.size = size
+
+    def __call__(self, img, mask):
+        assert img.size == mask.size
+        w, h = img.size
+        if (w >= h and w == self.size) or (h >= w and h == self.size):
+            return img, mask
+        if w > h:
+            ow = self.size
+            oh = int(self.size * h / w)
+            return img.resize((ow, oh), Image.BILINEAR), mask.resize((ow, oh), Image.NEAREST)
+        else:
+            oh = self.size
+            ow = int(self.size * w / h)
+            return img.resize((ow, oh), Image.BILINEAR), mask.resize((ow, oh), Image.NEAREST)
+
+
+class RandomSizedCrop(object):
+    def __init__(self, size):
+        self.size = size
+
+    def __call__(self, img, mask):
+        assert img.size == mask.size
+        for attempt in range(10):
+            area = img.size[0] * img.size[1]
+            target_area = random.uniform(0.45, 1.0) * area
+            aspect_ratio = random.uniform(0.5, 2)
+
+            w = int(round(math.sqrt(target_area * aspect_ratio)))
+            h = int(round(math.sqrt(target_area / aspect_ratio)))
+
+            if random.random() < 0.5:
+                w, h = h, w
+
+            if w <= img.size[0] and h <= img.size[1]:
+                x1 = random.randint(0, img.size[0] - w)
+                y1 = random.randint(0, img.size[1] - h)
+
+                img = img.crop((x1, y1, x1 + w, y1 + h))
+                mask = mask.crop((x1, y1, x1 + w, y1 + h))
+                assert (img.size == (w, h))
+
+                return img.resize((self.size, self.size), Image.BILINEAR), mask.resize((self.size, self.size),
+                                                                                       Image.NEAREST)
+
+        # Fallback
+        scale = Scale(self.size)
+        crop = CenterCrop(self.size)
+        return crop(*scale(img, mask))
+
+
+class RandomRotate(object):
+    def __init__(self, degree):
+        self.degree = degree
+
+    def __call__(self, img, mask):
+        rotate_degree = random.random() * 2 * self.degree - self.degree
+        return img.rotate(rotate_degree, Image.BILINEAR), mask.rotate(rotate_degree, Image.NEAREST)
+
+
+class RandomSized(object):
+    def __init__(self, size):
+        self.size = size
+        self.scale = Scale(self.size)
+        self.crop = RandomCrop(self.size)
+
+    def __call__(self, img, mask):
+        assert img.size == mask.size
+
+        w = int(random.uniform(0.5, 2) * img.size[0])
+        h = int(random.uniform(0.5, 2) * img.size[1])
+
+        img, mask = img.resize((w, h), Image.BILINEAR), mask.resize((w, h), Image.NEAREST)
+
+        return self.crop(*self.scale(img, mask))
+
+
+class runningScore(object):
+
+    def __init__(self, n_classes):
+        self.n_classes = n_classes
+        self.confusion_matrix = np.zeros((n_classes, n_classes))
+
+    def _fast_hist(self, label_true, label_pred, n_class):
+        mask = (label_true >= 0) & (label_true < n_class)
+        hist = np.bincount(
+            n_class * label_true[mask].astype(int) +
+            label_pred[mask], minlength=n_class**2).reshape(n_class, n_class)
+        return hist
+
+    def update(self, label_trues, label_preds):
+        for lt, lp in zip(label_trues, label_preds):
+            self.confusion_matrix += self._fast_hist(lt.flatten(), lp.flatten(), self.n_classes)
+
+    def get_scores(self):
+        """Returns accuracy score evaluation result.
+            - overall accuracy
+            - mean accuracy
+            - mean IU
+            - fwavacc
+        """
+        hist = self.confusion_matrix
+        acc = np.diag(hist).sum() / hist.sum()
+        acc_cls = np.diag(hist) / hist.sum(axis=1)
+        acc_cls = np.nanmean(acc_cls)
+        iu = np.diag(hist) / (hist.sum(axis=1) + hist.sum(axis=0) - np.diag(hist))
+        mean_iu = np.nanmean(iu)
+        freq = hist.sum(axis=1) / hist.sum()
+        fwavacc = (freq[freq > 0] * iu[freq > 0]).sum()
+        cls_iu = dict(zip(range(self.n_classes), iu))
+
+        return {'Overall Acc: \t': acc,
+                'Mean Acc : \t': acc_cls,
+                'FreqW Acc : \t': fwavacc,
+                'Mean IoU : \t': mean_iu,}, cls_iu
+
+    def reset(self):
+        self.confusion_matrix = np.zeros((self.n_classes, self.n_classes))
+
+
+def cross_entropy2d(input, target, weight=None, size_average=True):
+    n, c, h, w = input.size()
+    nt, ht, wt = target.size()
+
+    # Handle inconsistent size between input and target
+    if h > ht and w > wt: # upsample labels
+        target = target.unsequeeze(1)
+        target = F.upsample(target, size=(h, w), mode='nearest')
+        target = target.sequeeze(1)
+    elif h < ht and w < wt: # upsample images
+        input = F.upsample(input, size=(ht, wt), mode='bilinear')
+    elif h != ht and w != wt:
+        raise Exception("Only support upsampling")
+
+    log_p = F.log_softmax(input, dim=1)
+    log_p = log_p.transpose(1, 2).transpose(2, 3).contiguous().view(-1, c)
+    log_p = log_p[target.view(-1, 1).repeat(1, c) >= 0]
+    log_p = log_p.view(-1, c)
+
+    mask = target >= 0
+    target = target[mask]
+    loss = F.nll_loss(log_p, target, ignore_index=250,
+                      weight=weight, size_average=False)
+    if size_average:
+        if mask.is_cuda:
+            loss /= mask.data.sum().type(torch.cuda.FloatTensor)
+        else:
+            loss /= mask.data.sum().type(torch.FloatTensor)
+    return loss
+
+def bootstrapped_cross_entropy2d(input, target, K, weight=None, size_average=True):
+    
+    batch_size = input.size()[0]
+
+    def _bootstrap_xentropy_single(input, target, K, weight=None, size_average=True):
+        n, c, h, w = input.size()
+        log_p = F.log_softmax(input, dim=1)
+        log_p = log_p.transpose(1, 2).transpose(2, 3).contiguous().view(-1, c)
+        log_p = log_p[target.view(n * h * w, 1).repeat(1, c) >= 0]
+        log_p = log_p.view(-1, c)
+
+        mask = target >= 0
+        target = target[mask]
+        loss = F.nll_loss(log_p, target, weight=weight, ignore_index=250,
+                          reduce=False, size_average=False)
+        topk_loss, _ = loss.topk(K)
+        reduced_topk_loss = topk_loss.sum() / K
+
+        return reduced_topk_loss
+
+    loss = 0.0
+    # Bootstrap from each image not entire batch
+    for i in range(batch_size):
+        loss += _bootstrap_xentropy_single(input=torch.unsqueeze(input[i], 0),
+                                           target=torch.unsqueeze(target[i], 0),
+                                           K=K,
+                                           weight=weight,
+                                           size_average=size_average)
+    return loss / float(batch_size)
+
+
+def multi_scale_cross_entropy2d(input, target, weight=None, size_average=True, scale_weight=None):
+    # Auxiliary training for PSPNet [1.0, 0.4] and ICNet [1.0, 0.4, 0.16]
+    if scale_weight == None: # scale_weight: torch tensor type
+        n_inp = len(input)
+        scale = 0.4
+        scale_weight = torch.pow(scale * torch.ones(n_inp), torch.arange(n_inp))
+
+    loss = 0.0
+    for i, inp in enumerate(input):
+        loss = loss + scale_weight[i] * cross_entropy2d(input=inp, target=target, weight=weight, size_average=size_average)
+
+    return loss
+
 
 import pdb
 
