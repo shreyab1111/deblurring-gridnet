@@ -12,21 +12,11 @@ from tqdm import tqdm
 
 from model import GridNet
 
-
-def get_loader(name):
-    """get_loader
-    :param name:
-    """
-    return {
-        'pascal': pascalVOCLoader,
-        'camvid': camvidLoader,
-        'ade20k': ADE20KLoader,
-        'mit_sceneparsing_benchmark': MITSceneParsingBenchmarkLoader,
-        'cityscapes': cityscapesLoader,
-        'nyuv2': NYUv2Loader,
-        'sunrgbd': SUNRGBDLoader,
-    }[name]
-
+import math
+import numbers
+import random
+from PIL import Image, ImageOps
+import pdb
 
 def get_data_path(name, config_file='config.json'):
     """get_data_path
@@ -36,11 +26,6 @@ def get_data_path(name, config_file='config.json'):
     data = json.load(open(config_file))
     return data[name]['data_path']
 
-
-import math
-import numbers
-import random
-from PIL import Image, ImageOps
 
 class Compose(object):
     def __init__(self, augmentations):
@@ -158,7 +143,6 @@ class RandomSizedCrop(object):
 
                 return img.resize((self.size, self.size), Image.BILINEAR), mask.resize((self.size, self.size),
                                                                                        Image.NEAREST)
-
         # Fallback
         scale = Scale(self.size)
         crop = CenterCrop(self.size)
@@ -307,9 +291,6 @@ def multi_scale_cross_entropy2d(input, target, weight=None, size_average=True, s
         loss = loss + scale_weight[i] * cross_entropy2d(input=inp, target=target, weight=weight, size_average=size_average)
 
     return loss
-
-
-import pdb
 
 def train(args):
 
